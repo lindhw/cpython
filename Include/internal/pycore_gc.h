@@ -224,6 +224,7 @@ static inline void _PyObject_GC_TRACK(
                           filename, lineno, __func__);
 
     struct _gc_runtime_state *gcstate = &_PyInterpreterState_GET()->gc;
+    // 将对象插入第 0 代链表的末尾。
     PyGC_Head *generation0 = gcstate->generation0;
     PyGC_Head *last = (PyGC_Head*)(generation0->_gc_prev);
     _PyGCHead_SET_NEXT(last, gc);
@@ -259,11 +260,14 @@ static inline void _PyObject_GC_UNTRACK(
     _PyObject_CLEAR_GC_BITS(op, _PyGC_BITS_TRACKED);
 #else
     PyGC_Head *gc = _Py_AS_GC(op);
+    // 将对象从当前所在的 GC 链表中移除。
     PyGC_Head *prev = _PyGCHead_PREV(gc);
     PyGC_Head *next = _PyGCHead_NEXT(gc);
     _PyGCHead_SET_NEXT(prev, next);
     _PyGCHead_SET_PREV(next, prev);
+    // _gc_next 为 0 表示对象不再被 GC 跟踪。
     gc->_gc_next = 0;
+    // 保留对象已执行终结处理的标志，即使停止跟踪也不能丢失此状态。
     gc->_gc_prev &= _PyGC_PREV_MASK_FINALIZED;
     struct _gc_runtime_state *gcstate = &_PyInterpreterState_GET()->gc;
     gcstate->heap_size--;
