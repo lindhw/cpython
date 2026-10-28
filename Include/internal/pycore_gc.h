@@ -222,7 +222,7 @@ static inline void _PyObject_GC_TRACK(
                           (gc->_gc_prev & _PyGC_PREV_MASK_COLLECTING) == 0,
                           "object is in generation which is garbage collected",
                           filename, lineno, __func__);
-
+    // 将对象插入到 generation0 链表的末尾
     struct _gc_runtime_state *gcstate = &_PyInterpreterState_GET()->gc;
     PyGC_Head *generation0 = gcstate->generation0;
     PyGC_Head *last = (PyGC_Head*)(generation0->_gc_prev);
@@ -258,12 +258,17 @@ static inline void _PyObject_GC_UNTRACK(
 #ifdef Py_GIL_DISABLED
     _PyObject_CLEAR_GC_BITS(op, _PyGC_BITS_TRACKED);
 #else
+    // 对象从 generation0 链表中移除
     PyGC_Head *gc = _Py_AS_GC(op);
     PyGC_Head *prev = _PyGCHead_PREV(gc);
     PyGC_Head *next = _PyGCHead_NEXT(gc);
     _PyGCHead_SET_NEXT(prev, next);
     _PyGCHead_SET_PREV(next, prev);
+
+    // next指针 = 0， 表示对象不再被GC跟踪
     gc->_gc_next = 0;
+    // prev指针保留 _PyGC_PREV_MASK_FINALIZED 标志位，表示对象是否已经被finalize
+    // 即使对象暂时退出 GC 跟踪，也不能随便丢掉这个状态
     gc->_gc_prev &= _PyGC_PREV_MASK_FINALIZED;
     struct _gc_runtime_state *gcstate = &_PyInterpreterState_GET()->gc;
     gcstate->heap_size--;

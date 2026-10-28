@@ -37,7 +37,7 @@ typedef struct _gc_runtime_state GCState;
 // Only unreachable objects have this flag.
 //
 // No objects in interpreter have this flag after GC ends.
-#define PREV_MASK_COLLECTING   _PyGC_PREV_MASK_COLLECTING
+#define PREV_MASK_COLLECTING   _PyGC_PREV_MASK_COLLECTING  // 2 （10）
 
 // Lowest bit of _gc_next is used for UNREACHABLE flag.
 //
@@ -68,6 +68,7 @@ gc_clear_collecting(PyGC_Head *g)
     g->_gc_prev &= ~PREV_MASK_COLLECTING;
 }
 
+// _gc_prev GC 期间也可能保存临时引用计数（除了最低两位）
 static inline Py_ssize_t
 gc_get_refs(PyGC_Head *g)
 {
@@ -98,10 +99,10 @@ gc_decref(PyGC_Head *g)
     g->_gc_prev -= 1 << _PyGC_PREV_SHIFT;
 }
 
-
+// 取第n代的头节点
 #define GEN_HEAD(gcstate, n) (&(gcstate)->generations[n].head)
 
-
+// 获取当前解释器的GCState
 static GCState *
 get_gc_state(void)
 {
@@ -110,6 +111,7 @@ get_gc_state(void)
 }
 
 
+// 初始化GCState各代+永久代链表
 void
 _PyGC_InitState(GCState *gcstate)
 {
@@ -124,12 +126,19 @@ _PyGC_InitState(GCState *gcstate)
         INIT_HEAD(gcstate->generations[i]);
     };
     gcstate->generation0 = GEN_HEAD(gcstate, 0);
+    // 初始化永久代链表的头节点
+    // 最重要的一点：永久代不是那些存活时间特别长的对象，也不是永远不会被释放的对象，而是被明确排除在循环 GC 扫描之外的对象
+    //调用 gc.freeze() 时，当前所有正在被 GC 跟踪的对象都会被移入永久代
+    // 永久代只是不参与循环 GC，不影响引用计数回收
     INIT_HEAD(gcstate->permanent_generation);
 
 #undef INIT_HEAD
 }
 
-
+// 初始化解释器的GCState
+// generation_stats 记录各代 GC 执行次数、回收数量、不可回收数量（记账，GC 工作了多少次，回收了多少对象）
+// garbage 保存 GC 无法自动处理的垃圾对象
+// callbacks 保存 GC 开始和结束时需要执行的回调函数
 PyStatus
 _PyGC_Init(PyInterpreterState *interp)
 {
@@ -184,10 +193,10 @@ _gc_next values
 
 _gc_next takes these values:
 
-0
+0 表示untracked
     The object is not tracked
 
-!= 0
+!= 0 最低位表示不可达
     Pointer to the next object in the GC list.
     Additionally, lowest bit is used temporary for
     NEXT_MASK_UNREACHABLE flag described below.
@@ -254,6 +263,7 @@ gc_list_remove(PyGC_Head *node)
  * named here) to the end of `list`.  This is semantically the same as
  * gc_list_remove(node) followed by gc_list_append(node, list).
  */
+// 将node从当前所在的gc链表中移除，并将其添加到list链表的末尾
 static void
 gc_list_move(PyGC_Head *node, PyGC_Head *list)
 {
@@ -273,6 +283,7 @@ gc_list_move(PyGC_Head *node, PyGC_Head *list)
 }
 
 /* append list `from` onto list `to`; `from` becomes an empty list */
+// 将from链表中的所有节点移动到to链表的末尾，并将from链表清空
 static void
 gc_list_merge(PyGC_Head *from, PyGC_Head *to)
 {
@@ -305,6 +316,7 @@ gc_list_size(PyGC_Head *list)
 }
 
 /* Walk the list and mark all objects as non-collecting */
+// 将collectable链表中的所有对象的gc_prev标记为非collecting状态
 static inline void
 gc_list_clear_collecting(PyGC_Head *collectable)
 {
@@ -1433,6 +1445,8 @@ gc_collect_main(PyThreadState *tstate, int generation, _PyGC_Reason reason)
     int i;
     PyGC_Head *young; /* the generation we are examining */
     PyGC_Head *old; /* next older generation */
+
+    //
     PyGC_Head unreachable; /* non-problematic unreachable trash */
     PyGC_Head finalizers;  /* objects with, & reachable from, __del__ */
     PyGC_Head *gc;
@@ -1449,7 +1463,7 @@ gc_collect_main(PyThreadState *tstate, int generation, _PyGC_Reason reason)
         return 0;
     }
     gcstate->frame = tstate->current_frame;
-
+    // 自动选择需要收集的最老的代。将收集该代及其所有较年轻的代中的对象。
     if (generation == GENERATION_AUTO) {
         // Select the oldest generation that needs collecting. We will collect
         // objects from that generation and all generations younger than it.
