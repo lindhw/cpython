@@ -405,6 +405,11 @@ validate_list(PyGC_Head *head, enum flagstates flags)
 /* Set all gc_refs = ob_refcnt.  After this, gc_refs is > 0 and
  * PREV_MASK_COLLECTING bit is set for all objects in containers.
  */
+ // 在垃圾回收期间，_gc_prev 除了最低两位标志外，还用于保存临时引用计数。
+ // update_refs() 将对象的引用计数保存到 gc_refs （也就是_gc_prev）中，
+ // 并设置 PREV_MASK_COLLECTING 标志。
+ // 因此链表只剩 _gc_next 有效，只能单向正着走
+ // 返回当前代中对象的数量。
 static Py_ssize_t
 update_refs(PyGC_Head *containers)
 {
@@ -415,12 +420,14 @@ update_refs(PyGC_Head *containers)
     while (gc != containers) {
         next = GC_NEXT(gc);
         PyObject *op = FROM_GC(gc);
+        // immortal 对象不参与垃圾回收
         if (_Py_IsImmortal(op)) {
             assert(!_Py_IsStaticImmortal(op));
             _PyObject_GC_UNTRACK(op);
             gc = next;
             continue;
         }
+        // 将对象的引用计数保存到 gc_refs （也就是_gc_prev）中，并设置 PREV_MASK_COLLECTING 标志。
         gc_reset_refs(gc, Py_REFCNT(op));
         /* Python's cyclic gc should never see an incoming refcount
          * of 0:  if something decref'ed to 0, it should have been
@@ -448,6 +455,43 @@ update_refs(PyGC_Head *containers)
 }
 
 /* A traversal callback for subtract_refs. */
+// op参数是当前遍历到的对象，parent参数是引用op的对象。
+// 如：
+// typedef struct {
+//     PyObject_HEAD
+
+//     PyObject *child;    // 可能引用任意 Python 对象
+//     PyObject *name;     // 只保存字符串
+//     PyObject *dict;     // 实例属性字典
+//     PyObject *callback; // 回调对象
+//     void *native_data;  // 纯 C/C++ 指针
+// } MyObject;
+
+// static int
+// MyObject_traverse(
+//     MyObject *self,
+//     visitproc visit,
+//     void *arg)
+// {
+//     Py_VISIT(self->child);
+//     Py_VISIT(self->name);
+//     Py_VISIT(self->dict);
+//     Py_VISIT(self->callback);
+
+//     return 0;
+// }
+
+// #define Py_VISIT(op)                         \
+//     do {                                     \
+//         if (op) {                            \
+//             int vret = visit(op, arg);       \
+//             if (vret) {                      \
+//                 return vret;                 \
+//             }                                \
+//         }                                    \
+//     } while (0)
+
+// op 参数就是child、name、dict、callback这些对象，parent参数就是self对象。
 static int
 visit_decref(PyObject *op, void *parent)
 {
@@ -460,6 +504,7 @@ visit_decref(PyObject *op, void *parent)
          * generation being collected, which can be recognized
          * because only they have positive gc_refs.
          */
+        // 用上面的例子来说，myobject引用了child, 这里去访问child对象的gc_refs，减一，表示child对象被引用的次数减少了。
         if (gc_is_collecting(gc)) {
             gc_decref(gc);
         }
@@ -505,14 +550,18 @@ subtract_refs(PyGC_Head *containers)
     PyGC_Head *gc = GC_NEXT(containers);
     for (; gc != containers; gc = GC_NEXT(gc)) {
         PyObject *op = FROM_GC(gc);
+        // 对每个python对象，调用其 tp_traverse 方法，遍历对象的所有引用，
+        // 并调用 visit_decref 回调函数，将引用计数减一。
         traverse = Py_TYPE(op)->tp_traverse;
         (void) traverse(op,
                         visit_decref,
-                        op);
+                        op); // 这个op就是visit_decref的parent参数
     }
 }
 
 /* A traversal callback for move_unreachable. */
+// 从move_unreachable过来的，op表示 self调用traverse遍历到的对象，(比如上面例子中的child、name、dict、callback)
+// args参数是move_unreachable传入的gc链表表头。
 static int
 visit_reachable(PyObject *op, void *arg)
 {
@@ -529,6 +578,7 @@ visit_reachable(PyObject *op, void *arg)
     // This also skips objects "to the left" of the current position in
     // move_unreachable's scan of the 'young' list - they've already been
     // traversed, and no longer have the PREV_MASK_COLLECTING flag.
+    // 也就是说，只有在当前代回收的对象才会被处理
     if (! gc_is_collecting(gc)) {
         return 0;
     }
@@ -536,6 +586,9 @@ visit_reachable(PyObject *op, void *arg)
     // an untracked object.
     _PyObject_ASSERT(op, gc->_gc_next != 0);
 
+    // 对象已经被标记成unreachable了，
+    // 要把它从它所在的链表中移除，放到reachable链表中去。
+    // 引用计数改成1，表示有人在引用它
     if (gc->_gc_next & NEXT_MASK_UNREACHABLE) {
         /* This had gc_refs = 0 when move_unreachable got
          * to it, but turns out it's reachable after all.
@@ -563,6 +616,7 @@ visit_reachable(PyObject *op, void *arg)
          * we need to do is tell move_unreachable that it's
          * reachable.
          */
+        // 该对象引用计数被之前subtract_refs()减为0了, 但是现在被其他对象引用了，所以要把它的引用计数改为1，表示有人在引用它。
         gc_set_refs(gc, 1);
     }
     /* Else there's nothing to do.
@@ -602,9 +656,13 @@ move_unreachable(PyGC_Head *young, PyGC_Head *unreachable)
      * left of us in 'young' now have been scanned, and no objects here
      * or to the right have been scanned yet.
      */
-
+    // 遍历 young 链表中的每个对象，检查它们的 gc_refs 是否大于 0。
     while (gc != young) {
         if (gc_get_refs(gc)) {
+            // 还有被引用，说明这个引用是从外部来的（不是本轮gc对象链表中的）
+            // 说明这个对象不能被回收，接下来应该调用该对象的tp_traverse方法，
+            // 遍历它的所有引用对象，说明它们也是可达的，不能被回收。
+
             /* gc is definitely reachable from outside the
              * original 'young'.  Mark it as such, and traverse
              * its pointers to find any other objects that may
@@ -622,13 +680,27 @@ move_unreachable(PyGC_Head *young, PyGC_Head *unreachable)
             (void) traverse(op,
                     visit_reachable,
                     (void *)young);
+            
+            // 循环里一边扫描 young，一边就地重建这条链
+            // prev 的含义就是："最后一个被确认可达、留在 young 里的节点" (不可达的节点会被移到 unreachable 链表里去)
+
+            // update_refs 用 gc_reset_refs 把每个对象的 _gc_prev 覆盖成了 gc_refs，
+            // 所以从那一刻起，整条 young 链的反向指针全没了（只剩 _gc_next 能用）。
+            // 现在 gc 被确认可达、且它的前驱 prev 也确定了，就可以把反向指针补回来。
+            // _gc_prev = prev指针 | FINALIZED | COLLECTING
+
             // relink gc_prev to prev element.
             _PyGCHead_SET_PREV(gc, prev);
             // gc is not COLLECTING state after here.
+            // 表示这个对象已经被确认可达了，正式退出本轮收集 不会被人重复处理 也不会被当做unreachable候选了
             gc_clear_collecting(gc);
             prev = gc;
         }
         else {
+            // gc_refs == 0, 说明这个对象没有被引用，是不可达的，按道理应该是要被回收的
+            // 但是！！！ 它可能会被上面说的其他内部对象引用，所以不能直接回收，
+            // 要先把它放到 unreachable 链表中去，等后续处理。
+
             /* This *may* be unreachable.  To make progress,
              * assume it is.  gc isn't directly reachable from
              * any object we've already traversed, but may be
@@ -673,6 +745,16 @@ move_unreachable(PyGC_Head *young, PyGC_Head *unreachable)
 * and is much faster than a more complex approach that
 * would untrack all relevant tuples.
 */
+// 把那些「不可能参与循环引用」的元组，从 GC 的跟踪链表里摘出去，
+// 从此不再参与扫描，让后续每一轮 GC 都少扫一批对象
+// 为什么要跟踪元组，又为什么大部分不用跟踪
+// 循环 GC 只关心一件事：这个对象有没有可能构成引用环。
+
+// 元组是不可变容器，创建后无法再往里塞新元素 → 它自己不会主动产生新环；
+// 但如果元素全是原子类型（int / str / None / float / bytes…），
+// 那这些元素也不会指向任何东西 → 整个元组根本不可能在环里；
+// 反过来，t = ([],) 里装了个 list，list 完全可以 append(t) 回过头来 → 必须跟踪。
+
 static void
 untrack_tuples(PyGC_Head *head)
 {
@@ -714,10 +796,15 @@ move_legacy_finalizers(PyGC_Head *unreachable, PyGC_Head *finalizers)
         PyObject *op = FROM_GC(gc);
 
         _PyObject_ASSERT(op, gc->_gc_next & NEXT_MASK_UNREACHABLE);
+        // 把gc_next的NEXT_MASK_UNREACHABLE标志位清除掉，
+        // 变成一个正常的指针，指向下一个对象。
         gc->_gc_next &= ~NEXT_MASK_UNREACHABLE;
         next = (PyGC_Head*)gc->_gc_next;
 
+        // 如果有tp_del方法，就把它从unreachable链表移到finalizers链表里去。
         if (has_legacy_finalizer(op)) {
+            // 清掉 COLLECTING 位，表示"它已离开本次收集的判定集合，进入特殊处理集合"。
+            // 后面 visit_move 只捡带 COLLECTING 位的对象，这也能避免重复搬运
             gc_clear_collecting(gc);
             gc_list_move(gc, finalizers);
         }
@@ -1177,6 +1264,8 @@ flag set but it does not clear it to skip unnecessary iteration. Before the
 flag is cleared (for example, by using 'clear_unreachable_mask' function or
 by a call to 'move_legacy_finalizers'), the 'unreachable' list is not a normal
 list and we can not use most gc_list_* functions for it. */
+
+// 如何找出不可达对象？
 static inline Py_ssize_t
 deduce_unreachable(PyGC_Head *base, PyGC_Head *unreachable) {
     validate_list(base, collecting_clear_unreachable_clear);
@@ -1185,7 +1274,9 @@ deduce_unreachable(PyGC_Head *base, PyGC_Head *unreachable) {
      * refcount greater than 0 when all the references within the
      * set are taken into account).
      */
+    // 1. 链表中中的每个对象的引用计数拷贝到gc_prev中
     Py_ssize_t candidates = update_refs(base);  // gc_prev is used for gc_refs
+    // 2. 遍历链表中每个对象，访问其引用的对象，并将它的gc_refs减1
     subtract_refs(base);
 
     /* Leave everything reachable from outside base in base, and move
@@ -1223,7 +1314,9 @@ deduce_unreachable(PyGC_Head *base, PyGC_Head *unreachable) {
      * the reachable objects instead.  But this is a one-time cost, probably not
      * worth complicating the code to speed just a little.
      */
+    // 初始化unreachable链表
     gc_list_init(unreachable);
+    // 3. 将不可达对象从base移动到unreachable
     move_unreachable(base, unreachable);  // gc_prev is pointer again
     validate_list(base, collecting_clear_unreachable_clear);
     validate_list(unreachable, collecting_set_unreachable_set);
@@ -1531,10 +1624,17 @@ gc_collect_main(PyThreadState *tstate, int generation, _PyGC_Reason reason)
         old = young;
     }
     validate_list(old, collecting_clear_unreachable_clear);
-
+    
+    // [IMPORTANT] deduce_unreachable 重点逻辑，推导出哪些对象是不可达的，哪些是可达的。
+    // 不可达的对象会被移到 unreachable 链表中，后续会被清理。
     stats.candidates = deduce_unreachable(young, &unreachable);
 
+    // 把那些「不可能参与循环引用」的元组，从 GC 的跟踪链表里摘出去
     untrack_tuples(young);
+
+    // 如果还有old的话，把young中可达的对象移到old中，还在young中说明这些都是可达的，本轮不能回收
+    // 移到下一代中去吧，
+    // 如果young和old是同一个链表，说明已经收集到最老代了，存活的对象就继续留在当前代
     /* Move reachable objects to next generation. */
     if (young != old) {
         if (generation == NUM_GENERATIONS - 2) {
@@ -1553,6 +1653,12 @@ gc_collect_main(PyThreadState *tstate, int generation, _PyGC_Reason reason)
         gcstate->long_lived_pending = 0;
         gcstate->long_lived_total = gc_list_size(young);
     }
+
+    // 到这里 我们只需要关注unreachable链表中的对象了
+    // 接下来处理有老式tp_del方法的对象，
+    // 这些对象可能会在tp_del中复活其他对象，
+    // 所以我们需要把这些对象和它们可达的对象从unreachable中移到finalizers链表中，
+    // 后续不会被回收
 
     /* All objects in unreachable are trash, but objects reachable from
      * legacy finalizers (e.g. tp_del) can't safely be deleted.
