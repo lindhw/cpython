@@ -832,6 +832,7 @@ clear_unreachable_mask(PyGC_Head *unreachable)
 }
 
 /* A traversal callback for move_legacy_finalizer_reachable. */
+// arg = finalizers 链表的表头 
 static int
 visit_move(PyObject *op, void *arg)
 {
@@ -903,6 +904,16 @@ move_legacy_finalizer_reachable(PyGC_Head *finalizers)
  * for weakref can be executed and that could reveal unreachable objects to
  * Python-level code.  See bpo-38006 as an example bug.
  */
+ // 对象被回收之前 如果有弱引用指向它
+ // 需要调用弱引用的回调函数，通知它对象已经被回收了
+ // 
+ //弱引用指向的对象要死了，callback 要不要调、什么时候调，有三个坑：
+//callback 里可能会检查"对象到底死没死"（KeyedRef 就这么干）——所以调之前必须已经能看到 None；
+//弱引用自己也可能在这轮垃圾里——如果它和目标对象一起被回收，调 callback 既没必要又危险（callback 可能顺着闭包把垃圾图里的东西捞出来复活）；
+//callback 会执行任意 Python 代码——一旦执行，它看到的一切必须已经是"安全的终态"。
+//所以函数分成：第一遍只做筛选和"宣判死亡"，第二遍才真正执行 Python callback代码。
+
+// old 老的一代
 static int
 handle_weakref_callbacks(PyGC_Head *unreachable, PyGC_Head *old)
 {
@@ -917,6 +928,8 @@ handle_weakref_callbacks(PyGC_Head *unreachable, PyGC_Head *old)
      * callback needs to be invoked. We make another pass over wrcb_to_call,
      * invoking callbacks, after this pass completes.
      */
+    // 第一步： 遍历 unreachable 链表里的对象，
+    // 从他们身上找出各自的wrlist，遍历这个wrlist，找出那些带callback的wr，
     for (gc = GC_NEXT(unreachable); gc != unreachable; gc = next) {
         PyWeakReference **wrlist;
 
@@ -954,7 +967,9 @@ handle_weakref_callbacks(PyGC_Head *unreachable, PyGC_Head *old)
             // Note that _PyWeakref_ClearRef clears the weakref but leaves the
             // callback pointer intact.  Obscure: it also changes *wrlist.
             _PyObject_ASSERT((PyObject *)wr, wr->wr_object == op);
-            _PyWeakref_ClearRef(wr);
+            // 之后 callback 里 wr() 拿到的一定是 None
+            // _PyWeakref_ClearRef 会顺带把 wr 从 wrlist 里摘掉，所以上面才要提前存 next_wr
+            _PyWeakref_ClearRef(wr); // wr->wr_object = Py_None
             _PyObject_ASSERT((PyObject *)wr, wr->wr_object == Py_None);
 
             /* Headache time.  `op` is going away, and is weakly referenced by
@@ -985,6 +1000,7 @@ handle_weakref_callbacks(PyGC_Head *unreachable, PyGC_Head *old)
              * to imagine how calling it later could create a problem for us.  wr
              * is moved to wrcb_to_call in this case.
              */
+             // 如果wr也在本轮垃圾回收的不可达对象集合里，就不调用它的callback了，直接丢掉就行。
             if (gc_is_collecting(AS_GC((PyObject *)wr))) {
                 continue;
             }
@@ -992,12 +1008,13 @@ handle_weakref_callbacks(PyGC_Head *unreachable, PyGC_Head *old)
             /* Create a new reference so that wr can't go away
              * before we can process it again.
              */
-            Py_INCREF(wr);
+            Py_INCREF(wr); // 防止 wr 被回收掉，后面还要调用它的 callback呢
 
             /* Move wr to wrcb_to_call, for the next pass. */
             PyGC_Head *wrasgc = AS_GC((PyObject *)wr);
             // wrasgc is reachable, but next isn't, so they can't be the same
             _PyObject_ASSERT((PyObject *)wr, wrasgc != next);
+            // 挪到 wrcb_to_call 链表里去，后面会专门遍历这个链表，调用它们的 callback
             gc_list_move(wrasgc, &wrcb_to_call);
         }
     }
@@ -1005,6 +1022,7 @@ handle_weakref_callbacks(PyGC_Head *unreachable, PyGC_Head *old)
     /* Invoke the callbacks we decided to honor.  It's safe to invoke them
      * because they can't reference unreachable objects.
      */
+    // 第二步： 遍历 wrcb_to_call 链表里的对象，调用它们的 callback
     while (! gc_list_is_empty(&wrcb_to_call)) {
         PyObject *temp;
         PyObject *callback;
@@ -1037,7 +1055,11 @@ handle_weakref_callbacks(PyGC_Head *unreachable, PyGC_Head *old)
          * dict, leaving no other references to the weakref (excepting
          * ours).
          */
-        Py_DECREF(op);
+
+        Py_DECREF(op); // 释放前面一轮给它加的ref
+        // Py_DECREF(op) 之后，如果这个 weakref 对象仍在链表里，
+        // 说明它还有别的引用（callback 里有人持有它）→ gc_list_move(gc, old)，把它当存活对象晋升，绝不销毁；
+        // 如果它已经不在链表里了，说明 refcount 归零、tp_dealloc 已经把它带走了 → num_freed++
         if (wrcb_to_call._gc_next == (uintptr_t)gc) {
             /* object is still alive -- move it */
             gc_list_move(gc, old);
@@ -1671,6 +1693,7 @@ gc_collect_main(PyThreadState *tstate, int generation, _PyGC_Reason reason)
      * unreachable objects reachable *from* those are also uncollectable,
      * and we move those into the finalizers list too.
      */
+    // 把finalizers链表中对象可达的unreachable对象也移到finalizers中
     move_legacy_finalizer_reachable(&finalizers);
 
     validate_list(&finalizers, collecting_clear_unreachable_clear);
@@ -1682,6 +1705,9 @@ gc_collect_main(PyThreadState *tstate, int generation, _PyGC_Reason reason)
             debug_cycle("collectable", FROM_GC(gc));
         }
     }
+    // 先处理待callback的weakref对象，调用它们的回调函数，在调用他们callback之前，
+    // 先把他们的wr-object置为None
+    // callback 要先于 finalizer 执行，且 callback 看到的对象图已经是"弱引用全部断链"的安全状态。
 
     /* Clear weakrefs and invoke callbacks as necessary. */
     stats.collected += handle_weakref_callbacks(&unreachable, old);
@@ -1689,6 +1715,8 @@ gc_collect_main(PyThreadState *tstate, int generation, _PyGC_Reason reason)
     validate_list(&unreachable, collecting_set_unreachable_clear);
 
     /* Call tp_finalize on objects which have one. */
+    // 接下来就是调用tp_finalize方法了，tp_finalize方法可能会复活一些对象，
+    // 所以我们需要把这些复活的对象从unreachable中移到old中
     finalize_garbage(tstate, &unreachable);
 
     /* Handle any objects that may have resurrected after the call
