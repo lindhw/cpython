@@ -1076,6 +1076,7 @@ handle_weakref_callbacks(PyGC_Head *unreachable, PyGC_Head *old)
  * `unreachable` is weakly referenced anymore.  See the comments above
  * handle_weakref_callbacks() for why these weakrefs need to be cleared.
  */
+// 清除指向这批不可达对象的弱引用，并且不调用弱引用回调。
 static void
 clear_weakrefs(PyGC_Head *unreachable)
 {
@@ -1088,6 +1089,7 @@ clear_weakrefs(PyGC_Head *unreachable)
         PyObject *op = FROM_GC(gc);
         next = GC_NEXT(gc);
 
+        // 如果 op 自己就是弱引用对象，就断开它与被引用对象的联系
         if (PyWeakref_Check(op)) {
             /* A weakref inside the unreachable set is always cleared. See
              * the comments above handle_weakref_callbacks() for why these
@@ -1095,11 +1097,12 @@ clear_weakrefs(PyGC_Head *unreachable)
              */
             _PyWeakref_ClearRef((PyWeakReference *)op);
         }
-
+        // 如果对象不支持被弱引用，就跳过
         if (! _PyType_SUPPORTS_WEAKREFS(Py_TYPE(op))) {
             continue;
         }
 
+        // 取出它的弱引用链表，逐个清除
         /* It supports weakrefs.  Does it have any?
          *
          * This is never triggered for static types so we can avoid the
@@ -1116,6 +1119,12 @@ clear_weakrefs(PyGC_Head *unreachable)
              * changes *wrlist.
              */
             _PyObject_ASSERT((PyObject *)wr, wr->wr_object == op);
+            // 清除后，通过这些弱引用调用 wr() 会得到 None
+            // 为什么前面清过弱引用，这里还要清一次？
+
+            // 前面的 handle_weakref_callbacks() 清理了当时已有的弱引用，
+            // 并执行符合条件的回调。
+            // 之后的 tp_finalize 等用户代码可能创建新的弱引用，所以这里要再次清理
             _PyWeakref_ClearRef(wr);
             _PyObject_ASSERT((PyObject *)wr, wr->wr_object == Py_None);
         }
@@ -1147,7 +1156,9 @@ handle_legacy_finalizers(PyThreadState *tstate,
     PyGC_Head *gc = GC_NEXT(finalizers);
     for (; gc != finalizers; gc = GC_NEXT(gc)) {
         PyObject *op = FROM_GC(gc);
-
+        // 开启 gc.DEBUG_SAVEALL 时，把 finalizers 中的所有对象加入 gc.garbage
+        // 否则默认只是把仅将带有旧式 tp_del 的对象加入 gc.garbage
+        // 加入列表会增加对象的引用计数，让 Python 代码可以通过 gc.garbage 找到它们，检查并手动解除引用环
         if ((gcstate->debug & _PyGC_DEBUG_SAVEALL) || has_legacy_finalizer(op)) {
             if (PyList_Append(gcstate->garbage, op) < 0) {
                 _PyErr_Clear(tstate);
@@ -1155,7 +1166,7 @@ handle_legacy_finalizers(PyThreadState *tstate,
             }
         }
     }
-
+    // 无论对象是否加入 gc.garbage，整个链表都会合并到 old，原 finalizers 链表变空。这些对象仍被 GC 跟踪，后续还可能参与收集。
     gc_list_merge(finalizers, old);
 }
 
@@ -1180,19 +1191,29 @@ finalize_garbage(PyThreadState *tstate, PyGC_Head *collectable)
     gc_list_init(&seen);
 
     while (!gc_list_is_empty(collectable)) {
+        // 每次循环都从 collectable 链表里取出第一个对象，放到 seen 链表里去
         PyGC_Head *gc = GC_NEXT(collectable);
         PyObject *op = FROM_GC(gc);
         gc_list_move(gc, &seen);
+        // 什么不直接用普通的 next 遍历？ 因为tp_finalize能执行 Python 代码，可能解除引用，让当前对象或其他对象被释放，链表随时可能变化。
+        // 每次重新取链表头，可以避免保存一个随后失效的后继指针。
         if (!_PyGC_FINALIZED(op) &&
             (finalize = Py_TYPE(op)->tp_finalize) != NULL)
         {
+            //这里的顺序很关键：
+            // 1. 先标记已终结，防止后续处理再次调用它。
+            // 2. 临时增加引用，保证调用终结函数期间对象仍然有效。
+            // 3. 执行 finalize(op)。
+            // 4. 检查没有遗留异常；终结函数应自行处理异常。
+            // 5. 释放临时引用，此时对象可能立即被销毁。
             _PyGC_SET_FINALIZED(op);
             Py_INCREF(op);
             finalize(op);
             assert(!_PyErr_Occurred(tstate));
-            Py_DECREF(op);
+            Py_DECREF(op);  // 如果 这里之后还在seen链表里，说明它还被其他对象引用着，不会被销毁；如果不在了，说明它已经被销毁了。
         }
     }
+    // 把 seen 链表里的对象都放回 collectable 链表里去，继续后续处理。
     gc_list_merge(&seen, collectable);
 }
 
@@ -1200,6 +1221,8 @@ finalize_garbage(PyThreadState *tstate, PyGC_Head *collectable)
  * tricky business as the lists can be changing and we don't know which
  * objects may be freed.  It is possible I screwed something up here.
  */
+// 核心作用是：调用不可达对象的 tp_clear，清除它们持有的引用，打破引用环，
+//让引用计数机制完成释放
 static void
 delete_garbage(PyThreadState *tstate, GCState *gcstate,
                PyGC_Head *collectable, PyGC_Head *old)
@@ -1213,6 +1236,7 @@ delete_garbage(PyThreadState *tstate, GCState *gcstate,
         _PyObject_ASSERT_WITH_MSG(op, Py_REFCNT(op) > 0,
                                   "refcount is too small");
 
+        // 如果开启 gc.DEBUG_SAVEALL，就把对象保存到 gc.garbage，供调试查看，跳过 tp_clear。
         if (gcstate->debug & _PyGC_DEBUG_SAVEALL) {
             assert(gcstate->garbage != NULL);
             if (PyList_Append(gcstate->garbage, op) < 0) {
@@ -1222,8 +1246,8 @@ delete_garbage(PyThreadState *tstate, GCState *gcstate,
         else {
             inquiry clear;
             if ((clear = Py_TYPE(op)->tp_clear) != NULL) {
-                Py_INCREF(op);
-                (void) clear(op);
+                Py_INCREF(op); // 临时增加引用，保护当前对象
+                (void) clear(op); // 调用 tp_clear，清除对象持有的引用；这可能导致其他对象被释放
                 if (_PyErr_Occurred(tstate)) {
                     PyErr_FormatUnraisable("Exception ignored in tp_clear of %s",
                                            Py_TYPE(op)->tp_name);
@@ -1231,6 +1255,10 @@ delete_garbage(PyThreadState *tstate, GCState *gcstate,
                 Py_DECREF(op);
             }
         }
+        // 如果处理后，链表头仍然是刚才的对象，说明它还留在待处理链表中。
+        // 于是清除它的 COLLECTING 标志，将它移到 old，继续处理下一个对象。
+        // 移入 old 不代表它已经复活。 它可能仍被其他待处理对象引用，等那些对象的引用被清除时，才会释放。
+        // 移走它也能避免循环一直处理同一个对象。
         if (GC_NEXT(collectable) == gc) {
             /* object is still alive, move it, it may die later */
             gc_clear_collecting(gc);
@@ -1364,15 +1392,20 @@ handle_resurrected_objects(PyGC_Head *unreachable, PyGC_Head* still_unreachable,
 {
     // Remove the PREV_MASK_COLLECTING from unreachable
     // to prepare it for a new call to 'deduce_unreachable'
+    // 先清除上轮遗留的 COLLECTING 标志，为重新进行可达性判断做准备
     gc_list_clear_collecting(unreachable);
 
     // After the call to deduce_unreachable, the 'still_unreachable' set will
     // have the PREV_MARK_COLLECTING set, but the objects are going to be
     // removed so we can skip the expense of clearing the flag.
     PyGC_Head* resurrected = unreachable;
+    // 重新来一次可达性计算
     deduce_unreachable(resurrected, still_unreachable);
+    // 清除仍不可达对象 _gc_next 上的临时 UNREACHABLE 标志，使该链表恢复普通链表形式。
+    // 这里并没有清除 _gc_prev 上的 COLLECTING 标志。
     clear_unreachable_mask(still_unreachable);
 
+    // 把复活的对象合并到老代
     // Move the resurrected objects to the old generation for future collection.
     gc_list_merge(resurrected, old_generation);
 }
@@ -1722,9 +1755,14 @@ gc_collect_main(PyThreadState *tstate, int generation, _PyGC_Reason reason)
     /* Handle any objects that may have resurrected after the call
      * to 'finalize_garbage' and continue the collection with the
      * objects that are still unreachable */
+    // 执行 __del__ 时，对象可能把自己保存到全局变量中，从而“复活”。
+    // 因此，这个函数返回后，链表里的对象不一定仍然不可达。
+    // 后面的 handle_resurrected_objects() 会重新检查可达性，将复活的对象移回老代，
+    // 其余对象再进入清除引用环的阶段
     PyGC_Head final_unreachable;
     handle_resurrected_objects(&unreachable, &final_unreachable, old);
 
+    // 到这里 final_unreachable 链表中就是最终不可达的对象了，接下来就可以清除它们的引用环了。
     /* Clear weakrefs to objects in the unreachable set.  No Python-level
      * code must be allowed to access those unreachable objects.  During
      * delete_garbage(), finalizers outside the unreachable set might run
@@ -1738,13 +1776,17 @@ gc_collect_main(PyThreadState *tstate, int generation, _PyGC_Reason reason)
     * in finalizers to be freed.
     */
     stats.collected += gc_list_size(&final_unreachable);
+    // 拆除不可达对象的引用环，调用 tp_clear 方法清除容器对象的引用。
     delete_garbage(tstate, gcstate, &final_unreachable, old);
 
     /* Collect statistics on uncollectable objects found and print
      * debugging information. */
+    // 这里的 finalizers 链表包含：带有旧式终结槽 tp_del 的不可达对象 + 从这些对象出发能够到达的其他不可达对象。
+    // 前面已经说过的
     Py_ssize_t n = 0;
     for (gc = GC_NEXT(&finalizers); gc != &finalizers; gc = GC_NEXT(gc)) {
         n++;
+        // 开启 gc.DEBUG_UNCOLLECTABLE 后，还会逐个打印这些对象的类型和地址。
         if (gcstate->debug & _PyGC_DEBUG_UNCOLLECTABLE)
             debug_cycle("uncollectable", FROM_GC(gc));
     }
@@ -1762,11 +1804,17 @@ gc_collect_main(PyThreadState *tstate, int generation, _PyGC_Reason reason)
      * reachable list of garbage.  The programmer has to deal with
      * this if they insist on creating this type of structure.
      */
+    // 按条件加入 gc.garbage + 整个 finalizers 链表并回老代
     handle_legacy_finalizers(tstate, gcstate, &finalizers, old);
     validate_list(old, collecting_clear_unreachable_clear);
 
     /* Clear free list only during the collection of the highest
      * generation */
+    // 用来清空解释器中缓存的空闲对象内存，只在收集最老代时调用。
+    // 某些类型的对象释放后，CPython 会把它们的内存块放进 free list（空闲缓存），下次创建同类对象时直接复用，减少内存分配开销。
+    // 对象释放 → 内存块进入 free list → 下次创建对象时复用
+    // 这些缓存虽然能加快创建速度，但也会占用内存。全代收集时调用这个函数，将可以清理的缓存交还给底层内存分配器：
+    // 内存交给分配器后，也不保证立即归还操作系统，所以进程内存占用不一定马上下降。
     if (generation == NUM_GENERATIONS-1) {
         _PyGC_ClearAllFreeLists(tstate->interp);
     }
